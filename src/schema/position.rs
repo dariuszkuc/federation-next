@@ -145,6 +145,18 @@ pub(crate) enum CompositeTypeDefinitionPosition {
 }
 
 impl CompositeTypeDefinitionPosition {
+    pub(crate) fn is_object_type(&self) -> bool {
+        matches!(self, CompositeTypeDefinitionPosition::Object(_))
+    }
+
+    pub(crate) fn is_interface_type(&self) -> bool {
+        matches!(self, CompositeTypeDefinitionPosition::Interface(_))
+    }
+
+    pub(crate) fn is_union_type(&self) -> bool {
+        matches!(self, CompositeTypeDefinitionPosition::Union(_))
+    }
+
     pub(crate) fn type_name(&self) -> &Name {
         match self {
             CompositeTypeDefinitionPosition::Object(type_) => &type_.type_name,
