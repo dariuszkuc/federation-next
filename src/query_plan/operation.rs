@@ -1,5 +1,7 @@
 use crate::error::FederationError;
 use crate::error::SingleFederationError::Internal;
+use crate::link::federation_spec_definition::get_federation_spec_definition_from_subgraph;
+use crate::query_graph::extract_subgraphs_from_supergraph::ValidFederationSubgraph;
 use crate::query_graph::graph_path::OpPathElement;
 use crate::query_plan::conditions::Conditions;
 use crate::query_plan::operation::normalized_field_selection::{
@@ -16,7 +18,8 @@ use crate::query_plan::operation::normalized_selection_map::{
     NormalizedInlineFragmentSelectionValue, NormalizedSelectionMap, NormalizedSelectionValue,
 };
 use crate::schema::position::{
-    CompositeTypeDefinitionPosition, InterfaceTypeDefinitionPosition, SchemaRootDefinitionKind,
+    CompositeTypeDefinitionPosition, InterfaceTypeDefinitionPosition, ObjectTypeDefinitionPosition,
+    SchemaRootDefinitionKind,
 };
 use crate::schema::ValidFederationSchema;
 use apollo_compiler::ast::{DirectiveList, Name, OperationType};
@@ -26,6 +29,8 @@ use apollo_compiler::executable::{
 };
 use apollo_compiler::{name, Node};
 use indexmap::{IndexMap, IndexSet};
+use std::collections::hash_map::Keys;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::sync::{atomic, Arc};
@@ -452,6 +457,42 @@ impl NormalizedSelection {
     pub(crate) fn has_defer(&self) -> Result<bool, FederationError> {
         todo!()
     }
+
+    fn collect_used_fragment_names(&self, aggregator: &mut Arc<HashMap<Name, i32>>) {
+        match self {
+            NormalizedSelection::Field(field_selection) => {
+                if let Some(s) = field_selection.selection_set.clone() {
+                    s.collect_used_fragment_names(aggregator)
+                }
+            }
+            NormalizedSelection::InlineFragment(inline) => {
+                inline.selection_set.collect_used_fragment_names(aggregator);
+            }
+            NormalizedSelection::FragmentSpread(fragment) => {
+                let current_count = Arc::make_mut(aggregator)
+                    .entry(fragment.data().fragment_name.clone())
+                    .or_default();
+                *current_count += 1;
+            }
+        }
+    }
+
+    pub(crate) fn normalize(
+        &mut self,
+        parent_type: &CompositeTypeDefinitionPosition,
+    ) -> NormalizedSelection {
+        match self {
+            NormalizedSelection::Field(field) => {
+                NormalizedSelection::Field(Arc::new(field.normalize(parent_type)))
+            }
+            NormalizedSelection::FragmentSpread(spread) => {
+                NormalizedSelection::FragmentSpread(Arc::new(spread.normalize(parent_type)))
+            }
+            NormalizedSelection::InlineFragment(inline) => {
+                NormalizedSelection::InlineFragment(Arc::new(inline.normalize(parent_type)))
+            }
+        }
+    }
 }
 
 impl HasNormalizedSelectionKey for NormalizedSelection {
@@ -501,15 +542,32 @@ impl NormalizedFragment {
             )?,
         })
     }
+
+    // TODO: in JS code this is stored on the fragment
+    fn fragment_usages(&self) -> Arc<HashMap<Name, i32>> {
+        let mut usages = Arc::new(HashMap::new());
+        self.selection_set.collect_used_fragment_names(&mut usages);
+        usages
+    }
+
+    // TODO: in JS code this is stored on the fragment
+    fn collect_used_fragment_names(&self, aggregator: &mut Arc<HashMap<Name, i32>>) {
+        self.fragment_usages().iter().for_each(|(name, count)| {
+            let current_count = aggregator.entry(name.clone()).or_default();
+            *current_count += 1;
+        });
+    }
 }
 
 pub(crate) mod normalized_field_selection {
     use crate::error::FederationError;
     use crate::query_plan::operation::{
-        directives_with_sorted_arguments, HasNormalizedSelectionKey, NormalizedSelectionKey,
-        NormalizedSelectionSet,
+        directives_with_sorted_arguments, is_interface_object, HasNormalizedSelectionKey,
+        NormalizedSelectionKey, NormalizedSelectionSet, RebaseErrorHandlingOption, TYPENAME_FIELD,
     };
-    use crate::schema::position::{FieldDefinitionPosition, TypeDefinitionPosition};
+    use crate::schema::position::{
+        CompositeTypeDefinitionPosition, FieldDefinitionPosition, TypeDefinitionPosition,
+    };
     use crate::schema::ValidFederationSchema;
     use apollo_compiler::ast::{Argument, DirectiveList, Name};
     use apollo_compiler::Node;
@@ -558,6 +616,73 @@ pub(crate) mod normalized_field_selection {
 
         pub(crate) fn sibling_typename_mut(&mut self) -> &mut Option<Name> {
             &mut self.data.sibling_typename
+        }
+
+        pub(crate) fn rebase_on(
+            &self,
+            parent_type: &CompositeTypeDefinitionPosition,
+            schema: &ValidFederationSchema,
+            error_handling: &RebaseErrorHandlingOption,
+        ) -> Result<Option<NormalizedField>, FederationError> {
+            let field_parent = self.data().field_position.parent();
+            if field_parent == *parent_type {
+                return Ok(Some(self.clone()));
+            }
+
+            if self.data().name() == &TYPENAME_FIELD {
+                // TODO interface object info should be precomputed in QP constructor
+                return if schema
+                    .possible_runtime_types(parent_type.clone())?
+                    .iter()
+                    .any(|t| is_interface_object(t, schema))
+                {
+                    if let RebaseErrorHandlingOption::ThrowError = error_handling {
+                        Err(FederationError::internal(
+                            format!("Cannot add selection of field \"{}\" to selection set of parent type \"{}\" that is potentially an interface object type at runtime",
+                                    self.data().field_position,
+                                    parent_type
+                            )))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    let mut updated_field_data = self.data().clone();
+                    updated_field_data.field_position = parent_type.introspection_typename_field();
+                    Ok(Some(NormalizedField::new(updated_field_data)))
+                };
+            }
+
+            let parent_field = parent_type.field(self.data().name().clone())?;
+            return if self.can_rebase_on(parent_type) {
+                let mut updated_field_data = self.data().clone();
+                updated_field_data.field_position = parent_field;
+                Ok(Some(NormalizedField::new(updated_field_data)))
+            } else if let RebaseErrorHandlingOption::IgnoreError = error_handling {
+                Ok(None)
+            } else {
+                Err(FederationError::internal(format!(
+                    "Cannot add selection of field \"{}\" to selection set of parent type \"{}\"",
+                    self.data().field_position,
+                    parent_type
+                )))
+            };
+        }
+
+        /// Verifies whether given field can be rebase on following parent type.
+        ///
+        /// There are 2 valid cases we want to allow:
+        /// 1. either `parent_type` and `field_parent_type` are the same underlying type (same name) but from different underlying schema. Typically,
+        ///  happens when we're building subgraph queries but using selections from the original query which is against the supergraph API schema.
+        /// 2. or they are not the same underlying type, but the field parent type is from an interface (or an interface object, which is the same
+        ///  here), in which case we may be rebasing an interface field on one of the implementation type, which is ok. Note that we don't verify
+        ///  that `parent_type` is indeed an implementation of `field_parent_type` because it's possible that this implementation relationship exists
+        ///  in the supergraph, but not in any of the subgraph schema involved here. So we just let it be. Not that `rebase_on` will complain anyway
+        ///  if the field name simply does not exists in `parent_type`.
+        fn can_rebase_on(&self, parent_type: &CompositeTypeDefinitionPosition) -> bool {
+            let field_parent_type = self.data().field_position.parent();
+            return field_parent_type.type_name() == parent_type.type_name()
+                || field_parent_type.is_interface_type()
+                || field_parent_type.is_union_type();
         }
     }
 
@@ -673,8 +798,9 @@ pub(crate) mod normalized_inline_fragment_selection {
     use crate::error::FederationError;
     use crate::link::graphql_definition::{defer_directive_arguments, DeferDirectiveArguments};
     use crate::query_plan::operation::{
-        directives_with_sorted_arguments, is_deferred_selection, HasNormalizedSelectionKey,
-        NormalizedSelectionKey, NormalizedSelectionSet, SelectionId,
+        directives_with_sorted_arguments, is_deferred_selection, print_possible_runtimes,
+        runtime_types_intersect, HasNormalizedSelectionKey, NormalizedSelectionKey,
+        NormalizedSelectionSet, RebaseErrorHandlingOption, SelectionId,
     };
     use crate::schema::position::CompositeTypeDefinitionPosition;
     use crate::schema::ValidFederationSchema;
@@ -719,6 +845,86 @@ pub(crate) mod normalized_inline_fragment_selection {
 
         pub(crate) fn data(&self) -> &NormalizedInlineFragmentData {
             &self.data
+        }
+
+        pub(crate) fn rebase_on(
+            &self,
+            parent_type: &CompositeTypeDefinitionPosition,
+            schema: &ValidFederationSchema,
+            error_handling: &RebaseErrorHandlingOption,
+        ) -> Result<Option<NormalizedInlineFragment>, FederationError> {
+            if &self.data.parent_type_position == parent_type {
+                return Ok(Some(self.clone()));
+            }
+
+            let type_condition = self.data.type_condition_position.clone();
+            // This usually imply that the fragment is not from the same sugraph than then selection. So we need
+            // to update the source type of the fragment, but also "rebase" the condition to the selection set
+            // schema.
+            let (can_rebase, rebased_condition) = self.can_rebase_on(parent_type, schema);
+            if !can_rebase {
+                if let RebaseErrorHandlingOption::ThrowError = error_handling {
+                    let printable_type_condition = self
+                        .data
+                        .type_condition_position
+                        .clone()
+                        .map_or_else(|| "".to_string(), |t| t.to_string());
+                    let printable_runtimes = type_condition.map_or_else(
+                        || "undefined".to_string(),
+                        |t| print_possible_runtimes(&t, schema),
+                    );
+                    let printable_parent_runtimes = print_possible_runtimes(parent_type, schema);
+                    Err(FederationError::internal(
+                        format!("Cannot add fragment of condition \"{}\" (runtimes: [{}]) to parent type \"{}\" (runtimes: [{})",
+                                printable_type_condition,
+                                printable_runtimes,
+                                parent_type,
+                                printable_parent_runtimes,
+                        ),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                let mut rebased_fragment_data = self.data.clone();
+                rebased_fragment_data.type_condition_position = rebased_condition;
+                Ok(Some(NormalizedInlineFragment::new(rebased_fragment_data)))
+            }
+        }
+
+        pub(crate) fn can_rebase_on(
+            &self,
+            parent_type: &CompositeTypeDefinitionPosition,
+            parent_schema: &ValidFederationSchema,
+        ) -> (bool, Option<CompositeTypeDefinitionPosition>) {
+            if self.data.type_condition_position.is_none() {
+                // can_rebase = true, condition = undefined
+                return (true, None);
+            }
+
+            if let Some(Ok(rebased_condition)) = self
+                .data
+                .type_condition_position
+                .clone()
+                .and_then(|condition_position| {
+                    parent_schema.try_get_type(condition_position.type_name().clone())
+                })
+                .map(|rebased_condition_position| {
+                    CompositeTypeDefinitionPosition::try_from(rebased_condition_position)
+                })
+            {
+                // chained if let chains are not yet supported
+                // see https://github.com/rust-lang/rust/issues/53667
+                if runtime_types_intersect(parent_type, &rebased_condition, parent_schema) {
+                    // can_rebase = true, condition = rebased_condition
+                    (true, Some(rebased_condition))
+                } else {
+                    (false, None)
+                }
+            } else {
+                // can_rebase = false, condition = undefined
+                (false, None)
+            }
         }
     }
 
@@ -913,11 +1119,10 @@ impl NormalizedSelectionSet {
                         }
                     } else {
                         // if we don't expand fragments, we just convert FragmentSpread to NormalizedFragmentSpreadSelection
-                        let normalized_fragment_spread =
-                            NormalizedFragmentSpreadSelection::normalize(
-                                fragment_spread_selection,
-                                schema,
-                            );
+                        let normalized_fragment_spread = NormalizedFragmentSpreadSelection::from(
+                            fragment_spread_selection,
+                            schema,
+                        );
                         destination.push(NormalizedSelection::FragmentSpread(Arc::new(
                             normalized_fragment_spread,
                         )));
@@ -1247,6 +1452,136 @@ impl NormalizedSelectionSet {
     ) -> Result<NormalizedSelectionSet, FederationError> {
         todo!()
     }
+
+    fn collect_used_fragment_names(&self, aggregator: &mut Arc<HashMap<Name, i32>>) {
+        self.selections
+            .iter()
+            .for_each(|(_, s)| s.collect_used_fragment_names(aggregator));
+    }
+
+    pub(crate) fn rebase_on(
+        &self,
+        parent_type: &CompositeTypeDefinitionPosition,
+        fragments: &NamedFragments,
+        schema: &ValidFederationSchema,
+        error_handling: &RebaseErrorHandlingOption,
+    ) -> Result<NormalizedSelectionSet, FederationError> {
+        let mut rebased_selections = NormalizedSelectionMap::new();
+        let rebased_results: Result<Vec<Option<NormalizedSelection>>, FederationError> = self
+            .selections
+            .iter()
+            .map(|(_, selection)| match selection {
+                NormalizedSelection::Field(field) => {
+                    field.rebase_on(parent_type, fragments, schema, error_handling)
+                }
+                NormalizedSelection::FragmentSpread(spread) => {
+                    spread.rebase_on(parent_type, fragments, schema, error_handling)
+                }
+                NormalizedSelection::InlineFragment(inline) => {
+                    inline.rebase_on(parent_type, fragments, schema, error_handling)
+                }
+            })
+            .collect();
+        rebased_results?.iter().flatten().for_each(|rebased| {
+            rebased_selections.insert(rebased.clone());
+        });
+
+        Ok(NormalizedSelectionSet {
+            schema: self.schema.clone(),
+            type_position: self.type_position.clone(),
+            selections: Arc::new(rebased_selections),
+        })
+    }
+
+    /// Applies some normalization rules to this selection set in the context of the provided `parent_type`.
+    ///
+    /// Normalization mostly removes unnecessary/redundant inline fragments, so that for instance, with a schema:
+    /// ```graphql
+    /// type Query {
+    ///   t1: T1
+    ///   i: I
+    /// }
+    ///
+    /// interface I {
+    ///   id: ID!
+    /// }
+    ///
+    /// type T1 implements I {
+    ///   id: ID!
+    ///   v1: Int
+    /// }
+    ///
+    /// type T2 implements I {
+    ///   id: ID!
+    ///   v2: Int
+    /// }
+    /// ```
+    /// We can perform following normalization
+    /// ```
+    /// normalize({
+    ///   t1 {
+    ///     ... on I {
+    ///       id
+    ///     }
+    ///   }
+    ///   i {
+    ///     ... on T1 {
+    ///       ... on I {
+    ///         ... on T1 {
+    ///           v1
+    ///         }
+    ///         ... on T2 {
+    ///           v2
+    ///         }
+    ///       }
+    ///     }
+    ///     ... on T2 {
+    ///       ... on I {
+    ///         id
+    ///       }
+    ///     }
+    ///   }
+    /// }) === {
+    ///   t1 {
+    ///     id
+    ///   }
+    ///   i {
+    ///     ... on T1 {
+    ///       v1
+    ///     }
+    ///     ... on T2 {
+    ///       id
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// For this operation to be valid (to not throw), `parent_type` must be such that every field selection in
+    /// this selection set is such that its type position intersects with passed `parent_type` (there is no limitation
+    /// on the fragment selections, though any fragment selections whose condition do not intersects `parent_type`
+    /// will be discarded). Note that `self.normalize(self.type_condition)` is always valid and useful, but it is
+    /// also possible to pass a `parent_type` that is more "restrictive" than the selection current type position
+    /// (as long as the top-level fields of this selection set can be rebased on that type).
+    ///
+    /// Passing the option `recursive == false` makes the normalization only apply at the top-level, removing
+    /// any unnecessary top-level inline fragments, possibly multiple layers of them, but we never recurse
+    /// inside the sub-selection of an selection that is not removed by the normalization.
+    pub(crate) fn normalize(
+        &mut self,
+        parent_type: &CompositeTypeDefinitionPosition,
+    ) -> NormalizedSelectionSet {
+        let mut normalized_selection_map = NormalizedSelectionMap::new();
+        self.selections.iter().for_each(|(_, s)| {
+            let normalized = s.normalize(parent_type);
+            normalized_selection_map.insert(normalized);
+        });
+
+        NormalizedSelectionSet {
+            schema: self.schema.clone(),
+            type_position: self.type_position.clone(),
+            selections: Arc::new(normalized_selection_map),
+        }
+    }
 }
 
 impl NormalizedFieldSelection {
@@ -1298,6 +1633,70 @@ impl NormalizedFieldSelection {
                 None
             },
         }))
+    }
+
+    pub(crate) fn normalize(
+        &mut self,
+        parent_type: &CompositeTypeDefinitionPosition,
+    ) -> NormalizedFieldSelection {
+        todo!()
+    }
+
+    /// Returns a field selection "equivalent" to the one represented by this object, but such that its parent type
+    /// is the one provided as argument.
+    ///
+    /// Obviously, this operation will only succeed if this selection (both the field itself and its subselections)
+    /// make sense from the provided parent type. If this is not the case, this method will throw.
+    pub(crate) fn rebase_on(
+        &self,
+        parent_type: &CompositeTypeDefinitionPosition,
+        fragments: &NamedFragments,
+        schema: &ValidFederationSchema,
+        error_handling: &RebaseErrorHandlingOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
+        if &self.field.data().field_position.parent() == parent_type {
+            return Ok(Some(NormalizedSelection::Field(Arc::new(self.clone()))));
+        }
+
+        return if let Some(rebased) = self.field.rebase_on(parent_type, schema, error_handling)? {
+            if let Some(selection_set) = &self.selection_set {
+                let rebased_base_type_name = rebased.data().field_position.type_name();
+                let rebased_type: CompositeTypeDefinitionPosition = schema
+                    .get_type(rebased_base_type_name.clone())?
+                    .try_into()?;
+                let selection_set_type = &selection_set.type_position;
+                if &rebased_type == selection_set_type {
+                    return Ok(Some(NormalizedSelection::Field(Arc::new(
+                        NormalizedFieldSelection {
+                            field: rebased.clone(),
+                            selection_set: self.selection_set.clone(),
+                        },
+                    ))));
+                }
+
+                let rebased_selection_set =
+                    selection_set.rebase_on(&rebased_type, fragments, schema, error_handling)?;
+                if rebased_selection_set.selections.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(NormalizedSelection::Field(Arc::new(
+                        NormalizedFieldSelection {
+                            field: rebased.clone(),
+                            selection_set: Some(rebased_selection_set),
+                        },
+                    ))))
+                }
+            } else {
+                Ok(Some(NormalizedSelection::Field(Arc::new(
+                    NormalizedFieldSelection {
+                        field: rebased,
+                        selection_set: self.selection_set.clone(),
+                    },
+                ))))
+            }
+        } else {
+            Ok(None)
+        };
     }
 }
 
@@ -1370,7 +1769,7 @@ impl NormalizedFragmentSpreadSelection {
     /// - Stores the schema (may be useful for directives).
     /// - Encloses list of directives in `Arc`s to facilitate cheaper cloning.
     /// - Stores unique selection ID (used for deferred fragments)
-    pub(crate) fn normalize(
+    pub(crate) fn from(
         fragment_spread: &FragmentSpread,
         schema: &ValidFederationSchema,
     ) -> NormalizedFragmentSpreadSelection {
@@ -1428,6 +1827,13 @@ impl NormalizedFragmentSpreadSelection {
                 normalize_fragment_spread_option,
             )?,
         })
+    }
+
+    pub(crate) fn normalize(
+        &mut self,
+        parent_type: &CompositeTypeDefinitionPosition,
+    ) -> NormalizedFragmentSpreadSelection {
+        todo!()
     }
 }
 
@@ -1504,6 +1910,64 @@ impl NormalizedInlineFragmentSelection {
             )?,
         })
     }
+
+    pub(crate) fn normalize(
+        &mut self,
+        parent_type: &CompositeTypeDefinitionPosition,
+    ) -> NormalizedInlineFragmentSelection {
+        todo!()
+    }
+
+    pub(crate) fn rebase_on(
+        &self,
+        parent_type: &CompositeTypeDefinitionPosition,
+        named_fragments: &NamedFragments,
+        schema: &ValidFederationSchema,
+        error_handling: &RebaseErrorHandlingOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
+        if &self.inline_fragment.data().parent_type_position == parent_type {
+            return Ok(Some(NormalizedSelection::InlineFragment(Arc::new(
+                self.clone(),
+            ))));
+        }
+        return if let Some(rebased_fragment) =
+            self.inline_fragment
+                .rebase_on(parent_type, schema, error_handling)?
+        {
+            let rebased_casted_type = rebased_fragment
+                .data()
+                .type_condition_position
+                .clone()
+                .unwrap_or(rebased_fragment.data().parent_type_position.clone());
+            if &rebased_casted_type == parent_type {
+                Ok(Some(NormalizedSelection::InlineFragment(Arc::new(
+                    NormalizedInlineFragmentSelection {
+                        inline_fragment: rebased_fragment,
+                        selection_set: self.selection_set.clone(),
+                    },
+                ))))
+            } else {
+                let rebased_selection_set = self.selection_set.rebase_on(
+                    &rebased_casted_type,
+                    named_fragments,
+                    schema,
+                    error_handling,
+                )?;
+                if rebased_selection_set.selections.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(NormalizedSelection::InlineFragment(Arc::new(
+                        NormalizedInlineFragmentSelection {
+                            inline_fragment: rebased_fragment,
+                            selection_set: rebased_selection_set,
+                        },
+                    ))))
+                }
+            }
+        } else {
+            Ok(None)
+        };
+    }
 }
 
 impl<'a> NormalizedInlineFragmentSelectionValue<'a> {
@@ -1570,6 +2034,253 @@ pub(crate) fn equal_selection_sets(
     // representation instead of repeatedly inter-converting between its representation and the
     // apollo-rs one, but we'll cross that bridge if we come to it.
     todo!();
+}
+
+/// Options for handling rebasing errors.
+pub(crate) enum RebaseErrorHandlingOption {
+    IgnoreError,
+    ThrowError,
+}
+
+#[derive(Clone)]
+pub(crate) struct NamedFragments {
+    fragments: Arc<HashMap<Name, Node<NormalizedFragment>>>,
+}
+
+impl NamedFragments {
+    fn default() -> NamedFragments {
+        NamedFragments {
+            fragments: Arc::new(HashMap::new()),
+        }
+    }
+    fn new(fragments: Arc<HashMap<Name, Node<NormalizedFragment>>>) -> NamedFragments {
+        NamedFragments { fragments }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fragments.len() == 0
+    }
+
+    fn size(&self) -> usize {
+        self.fragments.len()
+    }
+
+    // TODO do we need it?
+    fn names(&self) -> Keys<Name, Node<NormalizedFragment>> {
+        self.fragments.keys()
+    }
+
+    // TODO do we need it?
+    fn definitions(&self) -> std::collections::hash_map::Values<Name, Node<NormalizedFragment>> {
+        self.fragments.values()
+    }
+
+    fn insert(&mut self, fragment: NormalizedFragment) {
+        Arc::make_mut(&mut self.fragments).insert(fragment.name.clone(), Node::new(fragment));
+    }
+
+    fn try_insert(&mut self, fragment: NormalizedFragment) -> Result<(), FederationError> {
+        match Arc::make_mut(&mut self.fragments).entry(fragment.name.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(FederationError::internal("Duplicate fragment name"))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let _ = entry.insert(Node::new(fragment));
+                Ok(())
+            }
+        }
+    }
+
+    fn get(&self, name: &Name) -> Option<Node<NormalizedFragment>> {
+        self.fragments.get(name).cloned()
+    }
+
+    fn contains(&self, name: &Name) -> bool {
+        self.fragments.contains_key(name)
+    }
+
+    /**
+     * Collect the usages of fragments that are used within the selection of other fragments.
+     */
+    fn collect_used_fragment_names(&self, aggregator: &mut Arc<HashMap<Name, i32>>) {
+        self.fragments.iter().for_each(|(_, fragment)| {
+            fragment
+                .selection_set
+                .collect_used_fragment_names(aggregator)
+        });
+    }
+
+    fn map(
+        &mut self,
+        mapper: &dyn Fn(&Node<NormalizedFragment>) -> NormalizedFragment,
+    ) -> NamedFragments {
+        todo!()
+    }
+
+    /// The mapper is called on every fragment definition (`fragment` argument), but in such a way that if a fragment A uses another fragment B,
+    /// then the mapper is guaranteed to be called on B _before_ being called on A. Further, the `newFragments` argument is a new `NamedFragments`
+    /// containing all the previously mapped definition (minus those for which the mapper returned `undefined`). So if A uses B (and the mapper
+    /// on B do not return undefined), then when mapper is called on A `newFragments` will have the mapped value for B.
+    fn map_in_dependency_order(
+        &mut self,
+        mapper: &dyn Fn(&Node<NormalizedFragment>, &NamedFragments) -> Option<NormalizedFragment>,
+    ) -> Option<NamedFragments> {
+        struct FragmentDependencies {
+            fragment: Node<NormalizedFragment>,
+            depends_on: Vec<Name>,
+        }
+        let mut fragments_map: HashMap<Name, FragmentDependencies> = HashMap::new();
+        Arc::make_mut(&mut self.fragments)
+            .iter_mut()
+            .for_each(|(_, fragment)| {
+                let usages: Vec<Name> = fragment
+                    .make_mut()
+                    .fragment_usages()
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<Name>>();
+                fragments_map.insert(
+                    fragment.name.clone(),
+                    FragmentDependencies {
+                        fragment: fragment.clone(),
+                        depends_on: usages,
+                    },
+                );
+            });
+
+        let mut removed_fragments: HashSet<Name> = HashSet::new();
+        let mut mapped_fragments = NamedFragments::default();
+        while !fragments_map.is_empty() {
+            // Note that graphQL specifies that named fragments cannot have cycles (https://spec.graphql.org/draft/#sec-Fragment-spreads-must-not-form-cycles)
+            // and so we're guaranteed that on every iteration, at least one element of the map is removed (so the `while` loop will terminate).
+            fragments_map.retain(|name, info| {
+                let can_remove = info
+                    .depends_on
+                    .iter()
+                    .all(|n| mapped_fragments.contains(n) || removed_fragments.contains(n));
+                if can_remove {
+                    if let Some(mapped) = mapper(&info.fragment, &mapped_fragments) {
+                        // TODO this actually throws in JS code -> should we also throw?
+                        // JS code has methods for
+                        // * add and throw exception if entry already there
+                        // * add_if_not_exists
+                        // Rust HashMap exposes insert (that overwrites) and try_insert (that throws)
+                        mapped_fragments.insert(mapped);
+                    } else {
+                        removed_fragments.insert(name.clone());
+                    }
+                }
+                // keep only the elements that cannot be removed
+                !can_remove
+            });
+        }
+
+        if mapped_fragments.is_empty() {
+            None
+        } else {
+            Some(mapped_fragments)
+        }
+    }
+
+    fn map_to_expanded_selection_set(
+        &mut self,
+        mapper: &dyn Fn(&NormalizedSelectionSet) -> Option<NormalizedSelectionSet>,
+    ) -> Option<NamedFragments> {
+        todo!()
+    }
+
+    /// When we rebase named fragments on a subgraph schema, only a subset of what the fragment handles may belong
+    /// to that particular subgraph. And there are a few sub-cases where that subset is such that we basically need or
+    /// want to consider to ignore the fragment for that subgraph, and that is when:
+    /// 1. the subset that apply is actually empty. The fragment wouldn't be valid in this case anyway.
+    /// 2. the subset is a single leaf field: in that case, using the one field directly is just shorter than using
+    ///   the fragment, so we consider the fragment don't really apply to that subgraph. Technically, using the
+    ///   fragment could still be of value if the fragment name is a lot smaller than the one field name, but it's
+    ///   enough of a niche case that we ignore it. Note in particular that one sub-case of this rule that is likely
+    ///   to be common is when the subset ends up being just `__typename`: this would basically mean the fragment
+    ///   don't really apply to the subgraph, and that this will ensure this is the case.
+    fn is_selection_set_worth_using(selection_set: &NormalizedSelectionSet) -> bool {
+        if selection_set.selections.len() == 0 {
+            return false;
+        }
+        if selection_set.selections.len() == 1 {
+            // true if NOT field selection OR non-leaf field
+            return if let Some((_, NormalizedSelection::Field(field_selection))) =
+                selection_set.selections.first()
+            {
+                field_selection.selection_set.is_some()
+            } else {
+                true
+            };
+        }
+        true
+    }
+
+    fn rebase_on(&mut self, schema: &ValidFederationSchema) -> Option<NamedFragments> {
+        self.map_in_dependency_order(&|fragment, mut named_fragments| {
+            if let Ok(rebased_type) = schema
+                .get_type(fragment.type_condition_position.type_name().clone())
+                .and_then(CompositeTypeDefinitionPosition::try_from)
+            {
+                if let Ok(mut rebased_selection) = fragment.selection_set.rebase_on(
+                    &rebased_type,
+                    named_fragments,
+                    schema,
+                    &RebaseErrorHandlingOption::IgnoreError,
+                ) {
+                    // Rebasing can leave some inefficiencies in some case (particularly when a spread has to be "expanded", see `FragmentSpreadSelection.rebaseOn`),
+                    // so we do a top-level normalization to keep things clean.
+                    rebased_selection = rebased_selection.normalize(&rebased_type);
+                    if NamedFragments::is_selection_set_worth_using(&rebased_selection) {
+                        let fragment = NormalizedFragment {
+                            schema: schema.clone(),
+                            name: fragment.name.clone(),
+                            type_condition_position: rebased_type.clone(),
+                            directives: fragment.directives.clone(),
+                            selection_set: rebased_selection,
+                        };
+                        named_fragments.insert(fragment);
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    fn filter(
+        &mut self,
+        predicate: &dyn Fn(&NormalizedFragment) -> bool,
+    ) -> Option<NamedFragments> {
+        todo!()
+    }
+
+    fn validate(&self) {
+        todo!()
+    }
+}
+
+pub(crate) struct RebasedFragments {
+    original_fragments: NamedFragments,
+    rebased_fragments: Arc<HashMap<String, Option<NamedFragments>>>,
+}
+
+impl RebasedFragments {
+    pub(crate) fn new(fragments: &HashMap<Name, Node<NormalizedFragment>>) -> Self {
+        Self {
+            original_fragments: NamedFragments::new(Arc::new(fragments.clone())),
+            rebased_fragments: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn for_subgraph(
+        &mut self,
+        subgraph: &ValidFederationSubgraph,
+    ) -> Option<NamedFragments> {
+        Arc::make_mut(&mut self.rebased_fragments)
+            .entry(subgraph.name.clone())
+            .or_insert_with(|| self.original_fragments.rebase_on(&subgraph.schema))
+            .clone()
+    }
 }
 
 impl TryFrom<&NormalizedOperation> for Operation {
@@ -1834,6 +2545,60 @@ pub(crate) fn normalize_operation(
         fragments: Arc::new(normalized_fragments),
     };
     Ok(normalized_operation)
+}
+
+// TODO remove once it is available in schema metadata
+fn is_interface_object(obj: &ObjectTypeDefinitionPosition, schema: &ValidFederationSchema) -> bool {
+    if let Ok(intf_obj_directive) = get_federation_spec_definition_from_subgraph(schema)
+        .and_then(|spec| spec.interface_object_directive(schema))
+    {
+        obj.try_get(&schema.schema()).is_some_and(|o| {
+            o.directives
+                .iter()
+                .any(|d| d.name == intf_obj_directive.name)
+        })
+    } else {
+        false
+    }
+}
+
+fn runtime_types_intersect(
+    type1: &CompositeTypeDefinitionPosition,
+    type2: &CompositeTypeDefinitionPosition,
+    schema: &ValidFederationSchema,
+) -> bool {
+    if type1 == type2 {
+        return true;
+    }
+
+    if let (Ok(runtimes_1), Ok(runtimes_2)) = (
+        schema.possible_runtime_types(type1.clone()),
+        schema.possible_runtime_types(type2.clone()),
+    ) {
+        return runtimes_1
+            .iter()
+            .any(|r1| runtimes_2.iter().any(|r2| r1.type_name == r2.type_name));
+    }
+
+    false
+}
+
+fn print_possible_runtimes(
+    composite_type: &CompositeTypeDefinitionPosition,
+    schema: &ValidFederationSchema,
+) -> String {
+    schema
+        .possible_runtime_types(composite_type.clone())
+        .map_or_else(
+            |_| "undefined".to_string(),
+            |runtimes| {
+                runtimes
+                    .iter()
+                    .map(|r| r.type_name.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            },
+        )
 }
 
 #[cfg(test)]
