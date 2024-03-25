@@ -23,7 +23,7 @@ use crate::schema::position::{
     SchemaRootDefinitionKind,
 };
 use crate::schema::ValidFederationSchema;
-use apollo_compiler::ast::{DirectiveList, Name, OperationType};
+use apollo_compiler::ast::{Argument, Directive, DirectiveList, Name, OperationType, Value};
 use apollo_compiler::executable::{
     Field, Fragment, FragmentSpread, InlineFragment, Operation, Selection, SelectionSet,
     VariableDefinition,
@@ -566,16 +566,16 @@ impl NormalizedSelection {
         &self,
         parent_type: &CompositeTypeDefinitionPosition,
         schema: &ValidFederationSchema,
-    ) -> NormalizedSelection {
+        option: &NormalizeSelectionOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
+        // TODO normalization should return generic selection i.e. inline fragment could become field selection
         match self {
-            NormalizedSelection::Field(field) => {
-                NormalizedSelection::Field(Arc::new(field.normalize(parent_type, schema)))
-            }
+            NormalizedSelection::Field(field) => field.normalize(parent_type, schema, option),
             NormalizedSelection::FragmentSpread(spread) => {
-                NormalizedSelection::FragmentSpread(Arc::new(spread.normalize(parent_type)))
+                spread.normalize(parent_type, schema, option)
             }
             NormalizedSelection::InlineFragment(inline) => {
-                NormalizedSelection::InlineFragment(Arc::new(inline.normalize(parent_type)))
+                inline.normalize(parent_type, schema, option)
             }
         }
     }
@@ -1894,21 +1894,22 @@ impl NormalizedSelectionSet {
     /// any unnecessary top-level inline fragments, possibly multiple layers of them, but we never recurse
     /// inside the sub-selection of an selection that is not removed by the normalization.
     pub(crate) fn normalize(
-        &mut self,
+        &self,
         parent_type: &CompositeTypeDefinitionPosition,
         schema: &ValidFederationSchema,
-    ) -> NormalizedSelectionSet {
+        option: &NormalizeSelectionOption,
+    ) -> Result<NormalizedSelectionSet, FederationError> {
         let mut normalized_selection_map = NormalizedSelectionMap::new();
         self.selections.iter().for_each(|(_, s)| {
-            let normalized = s.normalize(parent_type, schema);
+            let normalized = s.normalize(parent_type, schema, option);
             normalized_selection_map.insert(normalized);
         });
 
-        NormalizedSelectionSet {
+        Ok(NormalizedSelectionSet {
             schema: self.schema.clone(),
             type_position: self.type_position.clone(),
             selections: Arc::new(normalized_selection_map),
-        }
+        })
     }
 }
 
@@ -1988,59 +1989,55 @@ impl NormalizedFieldSelection {
         &self,
         parent_type: &CompositeTypeDefinitionPosition,
         schema: &ValidFederationSchema,
-    ) -> Result<Option<NormalizedFieldSelection>, FederationError> {
-        if self.selection_set.is_none() {
-            return Ok(None);
-        }
+        option: &NormalizeSelectionOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
+        // JS PORT NOTE: In JS implementation field selection stores field definition information,
+        // in RS version we only store the field position reference so we don't need to update the
+        // underlying elements
+        if let Some(selection_set) = &self.selection_set {
+            let mut normalized_selection: NormalizedSelectionSet =
+                if NormalizeSelectionOption::NormalizeRecursively == *option {
+                    selection_set.normalize(parent_type, schema, option)?
+                } else {
+                    selection_set.clone()
+                };
 
-        // This could be an interface field, and if we're normalizing on one of the implementation of that
-        // interface, we want to make sure we use the field of the implementation, as it may in particular
-        // have a more specific type which should propagate to the recursive call to normalize.
-        let definition = if self.field.data().schema == *schema
-            && self.field.data().field_position.parent() == *parent_type
-        {
-            self.field.data().field_position.get(schema.schema())
+            let mut selection = self.clone();
+            if normalized_selection.is_empty() {
+                // In rare cases, it's possible that everything in the sub-selection was trimmed away and so the
+                // sub-selection is empty. Which suggest something may be wrong with this part of the query
+                // intent, but the query was valid while keeping an empty sub-selection isn't. So in that
+                // case, we just add some "non-included" __typename field just to keep the query valid.
+                let directives = DirectiveList(vec![Node::new(Directive {
+                    name: name!("include"),
+                    arguments: vec![Node::new(Argument {
+                        name: name!("if"),
+                        value: Node::new(Value::Boolean(false)),
+                    })],
+                })]);
+                let non_included_typename =
+                    NormalizedSelection::Field(Arc::new(NormalizedFieldSelection {
+                        field: NormalizedField::new(NormalizedFieldData {
+                            schema: schema.clone(),
+                            field_position: parent_type.introspection_typename_field(),
+                            alias: None,
+                            arguments: Arc::new(vec![]),
+                            directives: Arc::new(directives),
+                            sibling_typename: None,
+                        }),
+                        selection_set: None,
+                    }));
+                normalized_selection
+                    .selections
+                    .insert(non_included_typename);
+                selection.selection_set = Some(normalized_selection);
+            } else {
+                selection.selection_set = Some(normalized_selection);
+            }
+            Ok(Some(NormalizedSelection::Field(Arc::new(selection))))
         } else {
-            parent_type
-                .field(self.field.data().name().clone())?
-                .get(schema.schema())
-        }?;
-
-        //     const definition = parentType === this.parentType
-        //       ? this.element.definition
-        //       : parentType.field(this.element.name);
-        //     assert(definition, `Cannot normalize ${this.element} at ${parentType} which does not have that field`)
-        //
-        //     const element = this.element.definition === definition ? this.element : this.element.withUpdatedDefinition(definition);
-        //     if (!this.selectionSet) {
-        //       return this.withUpdatedElement(element);  <== we don't store the definition on field element
-        //     }
-        //
-        //
-        //     const base = element.baseType();
-        //     assert(isCompositeType(base), () => `Field ${element} should not have a sub-selection`);
-        //     const normalizedSubSelection = (recursive ?? true) ? this.selectionSet.normalize({ parentType: base }) : this.selectionSet;
-        //     // In rare caes, it's possible that everything in the sub-selection was trimmed away and so the
-        //     // sub-selection is empty. Which suggest something may be wrong with this part of the query
-        //     // intent, but the query was valid while keeping an empty sub-selection isn't. So in that
-        //     // case, we just add some "non-included" __typename field just to keep the query valid.
-        //     if (normalizedSubSelection?.isEmpty()) {
-        //       return this.withUpdatedComponents(
-        //         element,
-        //         selectionSetOfElement(
-        //           new Field(
-        //             base.typenameField()!,
-        //             undefined,
-        //             [new Directive('include', { 'if': false })],
-        //           )
-        //         )
-        //       );
-        //     } else {
-        //       return this.withUpdatedComponents(element, normalizedSubSelection);
-        //     }
-
-        // TODO
-        self.clone()
+            Ok(None)
+        }
     }
 
     /// Returns a field selection "equivalent" to the one represented by this object, but such that its parent type
@@ -2250,8 +2247,10 @@ impl NormalizedFragmentSpreadSelection {
     pub(crate) fn normalize(
         &self,
         parent_type: &CompositeTypeDefinitionPosition,
-    ) -> NormalizedFragmentSpreadSelection {
-        self.clone()
+        schema: &ValidFederationSchema,
+        option: &NormalizeSelectionOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
+        todo!()
     }
 }
 
@@ -2350,7 +2349,9 @@ impl NormalizedInlineFragmentSelection {
     pub(crate) fn normalize(
         &self,
         parent_type: &CompositeTypeDefinitionPosition,
-    ) -> NormalizedInlineFragmentSelection {
+        schema: &ValidFederationSchema,
+        option: &NormalizeSelectionOption,
+    ) -> Result<Option<NormalizedSelection>, FederationError> {
         //   protected normalizeKnowingItIntersects({ parentType, recursive }: { parentType: CompositeType, recursive? : boolean }): FragmentSelection | SelectionSet | undefined {
         //     const thisCondition = this.element.typeCondition;
         //
@@ -2437,7 +2438,7 @@ impl NormalizedInlineFragmentSelection {
         //   }
 
         // todo!()
-        self.clone()
+        todo!()
     }
 
     pub(crate) fn rebase_on(
@@ -2553,9 +2554,17 @@ pub(crate) fn merge_selection_sets(
 }
 
 /// Options for handling rebasing errors.
+/// #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RebaseErrorHandlingOption {
     IgnoreError,
     ThrowError,
+}
+
+// Options for normalizing the selection sets
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NormalizeSelectionOption {
+    NormalizeRecursively,
+    NormalizeSingleSelection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2777,7 +2786,11 @@ impl NamedFragments {
                     Ok(mut rebased_selection) => {
                         // Rebasing can leave some inefficiencies in some case (particularly when a spread has to be "expanded", see `FragmentSpreadSelection.rebaseOn`),
                         // so we do a top-level normalization to keep things clean.
-                        rebased_selection = rebased_selection.normalize(&rebased_type, schema);
+                        rebased_selection = rebased_selection.normalize(
+                            &rebased_type,
+                            schema,
+                            NormalizeSelectionOption::NormalizeRecursively,
+                        );
                         if NamedFragments::is_selection_set_worth_using(&rebased_selection) {
                             let fragment = NormalizedFragment {
                                 schema: schema.clone(),
