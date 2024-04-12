@@ -95,13 +95,13 @@ pub(crate) mod normalized_selection_map {
         NormalizedSelectionSet,
     };
     use apollo_compiler::ast::Name;
+    use derive_more::DerefMut;
     use indexmap::IndexMap;
     use std::borrow::{Borrow, Cow};
     use std::hash::Hash;
     use std::iter::Map;
     use std::ops::Deref;
     use std::sync::Arc;
-    use derive_more::DerefMut;
 
     /// A "normalized" selection map is an optimized representation of a selection set which does
     /// not contain selections with the same selection "key". Selections that do have the same key
@@ -591,9 +591,15 @@ impl NormalizedSelection {
         option: NormalizeSelectionOption,
     ) -> Result<Option<NormalizedSelectionOrSet>, FederationError> {
         match self {
-            NormalizedSelection::Field(field) => field.normalize(parent_type, named_fragments, schema, option),
-            NormalizedSelection::FragmentSpread(spread) => spread.normalize(parent_type, named_fragments, schema),
-            NormalizedSelection::InlineFragment(inline) => inline.normalize(parent_type, named_fragments, schema, option),
+            NormalizedSelection::Field(field) => {
+                field.normalize(parent_type, named_fragments, schema, option)
+            }
+            NormalizedSelection::FragmentSpread(spread) => {
+                spread.normalize(parent_type, named_fragments, schema)
+            }
+            NormalizedSelection::InlineFragment(inline) => {
+                inline.normalize(parent_type, named_fragments, schema, option)
+            }
         }
     }
 }
@@ -1749,7 +1755,9 @@ impl NormalizedSelectionSet {
     ) -> Result<NormalizedSelectionSet, FederationError> {
         let mut normalized_selection_map = NormalizedSelectionMap::new();
         for (_, selection) in self.selections.iter() {
-            if let Some(selection_or_set) = selection.normalize(parent_type, named_fragments, schema, option)? {
+            if let Some(selection_or_set) =
+                selection.normalize(parent_type, named_fragments, schema, option)?
+            {
                 match selection_or_set {
                     NormalizedSelectionOrSet::Selection(normalized_selection) => {
                         normalized_selection_map.insert(normalized_selection);
@@ -1856,7 +1864,12 @@ impl NormalizedFieldSelection {
                     let field_composite_type_position: CompositeTypeDefinitionPosition = schema
                         .get_type(field.ty.inner_named_type().clone())?
                         .try_into()?;
-                    selection_set.normalize(&field_composite_type_position, named_fragments, schema, option)?
+                    selection_set.normalize(
+                        &field_composite_type_position,
+                        named_fragments,
+                        schema,
+                        option,
+                    )?
                 } else {
                     selection_set.clone()
                 };
@@ -2316,7 +2329,8 @@ impl NormalizedInlineFragmentSelection {
             };
             if useless_fragment || parent_type.is_object_type() {
                 let normalized_selection_set =
-                    self.selection_set.normalize(parent_type, named_fragments, schema, option)?;
+                    self.selection_set
+                        .normalize(parent_type, named_fragments, schema, option)?;
                 return if normalized_selection_set.is_empty() {
                     Ok(None)
                 } else {
@@ -2329,9 +2343,10 @@ impl NormalizedInlineFragmentSelection {
 
         // We preserve the current fragment, so we only recurse within the sub-selection if we're asked to be recursive.
         // (note that even if we're not recursive, we may still have some "lifting" to do)
-        let normalized_selection_set = if NormalizeSelectionOption::NormalizeRecursively == option
-        {
-            let normalized = self.selection_set.normalize(parent_type, named_fragments, schema, option)?;
+        let normalized_selection_set = if NormalizeSelectionOption::NormalizeRecursively == option {
+            let normalized =
+                self.selection_set
+                    .normalize(parent_type, named_fragments, schema, option)?;
             // It could be that nothing was satisfiable.
             if normalized.is_empty() {
                 if self.inline_fragment.data().directives.is_empty() {
@@ -2884,7 +2899,10 @@ impl NamedFragments {
         true
     }
 
-    pub(crate) fn rebase_on(&self, schema: &ValidFederationSchema) -> Result<NamedFragments, FederationError> {
+    pub(crate) fn rebase_on(
+        &self,
+        schema: &ValidFederationSchema,
+    ) -> Result<NamedFragments, FederationError> {
         let mut rebased_fragments = NamedFragments::default();
         for fragment in self.fragments.values() {
             if let Ok(rebased_type) = schema
@@ -2899,13 +2917,12 @@ impl NamedFragments {
                 ) {
                     // Rebasing can leave some inefficiencies in some case (particularly when a spread has to be "expanded", see `FragmentSpreadSelection.rebaseOn`),
                     // so we do a top-level normalization to keep things clean.
-                    rebased_selection = rebased_selection
-                        .normalize(
-                            &rebased_type,
-                            &rebased_fragments,
-                            schema,
-                            NormalizeSelectionOption::NormalizeRecursively,
-                        )?;
+                    rebased_selection = rebased_selection.normalize(
+                        &rebased_type,
+                        &rebased_fragments,
+                        schema,
+                        NormalizeSelectionOption::NormalizeRecursively,
+                    )?;
                     if NamedFragments::is_selection_set_worth_using(&rebased_selection) {
                         let fragment = NormalizedFragment {
                             schema: schema.clone(),
@@ -2918,7 +2935,7 @@ impl NamedFragments {
                     }
                 }
             }
-        };
+        }
         Ok(rebased_fragments)
     }
 }
@@ -2941,7 +2958,11 @@ impl RebasedFragments {
     pub(crate) fn for_subgraph(&mut self, subgraph: &ValidFederationSubgraph) -> NamedFragments {
         Arc::make_mut(&mut self.rebased_fragments)
             .entry(subgraph.name.clone())
-            .or_insert_with(|| self.original_fragments.rebase_on(&subgraph.schema).unwrap_or_else(|_| NamedFragments::default()))
+            .or_insert_with(|| {
+                self.original_fragments
+                    .rebase_on(&subgraph.schema)
+                    .unwrap_or_else(|_| NamedFragments::default())
+            })
             .clone()
     }
 }
